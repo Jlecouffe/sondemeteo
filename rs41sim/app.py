@@ -493,13 +493,18 @@ class App:
                     self._log(f"  {f_tone:.0f} Hz : {t0:.1f}s -> {t1:.1f}s")
                 return
 
-            # Chaque ton est fractionne en morceaux de ~0.25s avant envoi :
-            # un seul buffer de plusieurs secondes a 2.5 MSps peut depasser
-            # ce que libiio/le Pluto accepte en un appel (echoue avec
-            # [Errno 0] "No error", message peu explicite mais qui correspond
-            # a une taille de buffer TX refusee).
+            # Chaque ton est fractionne en morceaux de duree FIXE (~0.25s)
+            # avant envoi : un seul buffer de plusieurs secondes a 2.5 MSps
+            # peut depasser ce que libiio/le Pluto accepte en un appel
+            # (echoue avec [Errno 0] "No error"), et un DERNIER morceau plus
+            # court que les precedents echoue avec "Buffer length different
+            # than data length" (libiio refuse de changer la taille du
+            # buffer TX en cours de route) — d'ou une duree EXACTEMENT fixe
+            # a chaque appel, quitte a deborder un peu de la duree demandee
+            # (nombre de morceaux arrondi, jamais un dernier morceau tronque).
             assert tx is not None
             chunk_s = 0.25
+            n_chunks = max(1, round(duration / chunk_s))
             while not self._tone_stop_event.is_set():
                 start_clock = time.strftime("%H:%M:%S")
                 self._log(f"Debut du balayage a {start_clock} — ordre des tons :")
@@ -510,14 +515,11 @@ class App:
                 for f_tone in freqs:
                     if self._tone_stop_event.is_set():
                         break
-                    remaining = duration
                     phase = 0.0
-                    while remaining > 0:
-                        this_chunk = min(chunk_s, remaining)
+                    for _ in range(n_chunks):
                         chunk_iq, phase = generate_tone_chunk_iq(
-                            sample_rate, f_tone, this_chunk, rf.deviation_hz, phase0=phase)
+                            sample_rate, f_tone, chunk_s, rf.deviation_hz, phase0=phase)
                         tx.send(chunk_iq)
-                        remaining -= this_chunk
                         if self._tone_stop_event.is_set():
                             break
                 self._log("Passage termine.")
@@ -585,14 +587,21 @@ class App:
             # debut : le calcul (jusqu'a ~1s a 1200 bauds) doit rester hors
             # du chrono affiche a l'utilisateur, sinon les decalages
             # annonces ne correspondent plus a l'heure reelle d'emission.
+            # Un DERNIER morceau plus court que les precedents echoue avec
+            # "Buffer length different than data length" (libiio refuse de
+            # changer la taille du buffer TX en cours de route) : chaque
+            # segment precalcule est tronque a un multiple entier de
+            # chunk_samples avant l'envoi (perte de moins de 0.25s en fin de
+            # segment, negligeable ici).
             assert tx is not None
             chunk_samples = max(1, int(round(0.25 * sample_rate)))
             while not self._noise_stop_event.is_set():
                 self._log("Preparation du passage (peut prendre 1-2s a bas debit)...")
-                segments_iq = [
-                    generate_noise_fsk_chunk_iq(sample_rate, baud, duration, rf.deviation_hz, rf.bt, rng)
-                    for baud in bauds
-                ]
+                segments_iq = []
+                for baud in bauds:
+                    seg = generate_noise_fsk_chunk_iq(sample_rate, baud, duration, rf.deviation_hz, rf.bt, rng)
+                    usable_len = (len(seg) // chunk_samples) * chunk_samples
+                    segments_iq.append(seg[:usable_len])
                 if self._noise_stop_event.is_set():
                     break
                 start_clock = time.strftime("%H:%M:%S")
