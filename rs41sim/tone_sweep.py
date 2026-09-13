@@ -35,3 +35,26 @@ def generate_tone_sweep_iq(
         segments.append((f_tone, t_cursor, t_cursor + tone_duration_s))
         t_cursor += tone_duration_s
     return np.concatenate(chunks), segments
+
+
+def generate_tone_chunk_iq(
+    sample_rate: float,
+    freq_hz: float,
+    chunk_duration_s: float,
+    deviation_hz: float,
+    phase0: float = 0.0,
+) -> tuple[np.ndarray, float]:
+    """Meme principe que [generate_tone_sweep_iq], mais un seul morceau a la
+    fois, avec la phase de depart/arrivee explicite pour enchainer plusieurs
+    morceaux sans a-coup de phase. Sert a fractionner un ton de plusieurs
+    secondes en buffers TX de taille raisonnable (voir PlutoTransmitter.send,
+    limite a quelques Mo/appel sur certains firmwares/pilotes libiio — un
+    balayage de 10 tons x 3s en un seul buffer echoue avec [Errno 0])."""
+    n = int(round(chunk_duration_s * sample_rate))
+    t = np.arange(n) / sample_rate
+    audio = np.sin(2.0 * np.pi * freq_hz * t + phase0)
+    phase_step = 2.0 * np.pi * deviation_hz / sample_rate
+    phase = np.cumsum(audio * phase_step)
+    iq = np.exp(1j * phase).astype(np.complex64)
+    next_phase0 = (2.0 * np.pi * freq_hz * (n / sample_rate) + phase0) % (2.0 * np.pi)
+    return iq, next_phase0

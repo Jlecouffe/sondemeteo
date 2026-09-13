@@ -14,7 +14,7 @@ import numpy as np
 from .frame import SondeParams, build_frame
 from .modulate import gfsk_modulate
 from .pluto_tx import PlutoNotAvailable, PlutoTransmitter
-from .tone_sweep import generate_tone_sweep_iq
+from .tone_sweep import generate_tone_chunk_iq, generate_tone_sweep_iq
 from .trajectory import advance
 
 APP_TITLE = "Simulateur de trame RS41 (PlutoSDR)"
@@ -392,10 +392,9 @@ class App:
             else:
                 self._log(f"Mode fichier : ecriture dans {rf.output_dir}")
 
-            iq, segments = generate_tone_sweep_iq(
-                sample_rate, freqs, tone_duration_s=duration, deviation_hz=rf.deviation_hz)
-
             if rf.file_mode:
+                iq, segments = generate_tone_sweep_iq(
+                    sample_rate, freqs, tone_duration_s=duration, deviation_hz=rf.deviation_hz)
                 out_path = Path(rf.output_dir) / "tone_sweep.cfile"
                 iq.astype(np.complex64).tofile(out_path)
                 self._log(f"Balayage -> {out_path.name} ({len(freqs)} tons, {iq.size} echantillons)")
@@ -403,13 +402,33 @@ class App:
                     self._log(f"  {f_tone:.0f} Hz : {t0:.1f}s -> {t1:.1f}s")
                 return
 
+            # Chaque ton est fractionne en morceaux de ~0.25s avant envoi :
+            # un seul buffer de plusieurs secondes a 2.5 MSps peut depasser
+            # ce que libiio/le Pluto accepte en un appel (echoue avec
+            # [Errno 0] "No error", message peu explicite mais qui correspond
+            # a une taille de buffer TX refusee).
             assert tx is not None
+            chunk_s = 0.25
             while not self._stop_event.is_set() and not self._tone_stop_event.is_set():
                 start_clock = time.strftime("%H:%M:%S")
-                self._log(f"Debut du balayage a {start_clock} — ordre des tons (decalage depuis ce debut) :")
-                for f_tone, t0, t1 in segments:
-                    self._log(f"  {f_tone:.0f} Hz : +{t0:.1f}s -> +{t1:.1f}s")
-                tx.send(iq)
+                self._log(f"Debut du balayage a {start_clock} — ordre des tons :")
+                t_cursor = 0.0
+                for f_tone in freqs:
+                    self._log(f"  {f_tone:.0f} Hz : +{t_cursor:.1f}s -> +{t_cursor + duration:.1f}s")
+                    t_cursor += duration
+                for f_tone in freqs:
+                    if self._stop_event.is_set() or self._tone_stop_event.is_set():
+                        break
+                    remaining = duration
+                    phase = 0.0
+                    while remaining > 0:
+                        this_chunk = min(chunk_s, remaining)
+                        chunk_iq, phase = generate_tone_chunk_iq(
+                            sample_rate, f_tone, this_chunk, rf.deviation_hz, phase0=phase)
+                        tx.send(chunk_iq)
+                        remaining -= this_chunk
+                        if self._stop_event.is_set() or self._tone_stop_event.is_set():
+                            break
                 self._log("Passage termine.")
                 if not loop:
                     break
