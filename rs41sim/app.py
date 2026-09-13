@@ -14,6 +14,7 @@ import numpy as np
 from .frame import SondeParams, build_frame
 from .modulate import gfsk_modulate
 from .pluto_tx import PlutoNotAvailable, PlutoTransmitter
+from .noise_test import generate_noise_fsk_chunk_iq
 from .tone_sweep import generate_tone_chunk_iq, generate_tone_sweep_iq
 from .trajectory import advance
 
@@ -91,6 +92,11 @@ class App:
         self._tone_stop_event = threading.Event()
         self._tone_worker: threading.Thread | None = None
 
+        # Bruit FSK (debug codec vs largeur de bande, voir noise_test.py) :
+        # meme principe, worker/etat separes.
+        self._noise_stop_event = threading.Event()
+        self._noise_worker: threading.Thread | None = None
+
         self._build_ui()
         self.root.after(150, self._drain_log)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -103,13 +109,16 @@ class App:
         sonde_tab = ttk.Frame(notebook)
         rf_tab = ttk.Frame(notebook)
         tone_tab = ttk.Frame(notebook)
+        noise_tab = ttk.Frame(notebook)
         notebook.add(sonde_tab, text="Sonde / trajectoire / meteo")
         notebook.add(rf_tab, text="Parametres radio")
         notebook.add(tone_tab, text="Balayage de tons (debug)")
+        notebook.add(noise_tab, text="Bruit FSK (debug)")
 
         self._build_sonde_tab(sonde_tab)
         self._build_rf_tab(rf_tab)
         self._build_tone_tab(tone_tab)
+        self._build_noise_tab(noise_tab)
 
         bottom = ttk.Frame(self.root)
         bottom.pack(fill="x", padx=8, pady=(0, 8))
@@ -193,6 +202,42 @@ class App:
         self.tone_stop_btn = ttk.Button(btns, text="Arreter", command=self._on_tone_stop, state="disabled")
         self.tone_stop_btn.pack(side="left", padx=6)
 
+    def _build_noise_tab(self, parent: ttk.Frame) -> None:
+        ttk.Label(
+            parent,
+            text=(
+                "Emet des bits aleatoires en GFSK (meme mise en forme que RS41,\n"
+                "voir 'Filtre gaussien BT' dans Parametres radio) a differents debits,\n"
+                "pour comparer avec le balayage de tons : un contenu imprevisible\n"
+                "('facon donnees') peut etre bien plus degrade par un codec avec pertes\n"
+                "qu'un ton pur a frequence equivalente, meme si la bande passe bien."
+            ),
+            justify="left",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=4, pady=(4, 10))
+
+        ttk.Label(parent, text="Debits a tester (bauds, separes par virgule)").grid(
+            row=1, column=0, sticky="w", padx=4, pady=2)
+        self.noise_bauds_var = tk.StringVar(value="1200,2400,4800")
+        ttk.Entry(parent, textvariable=self.noise_bauds_var, width=48).grid(
+            row=1, column=1, columnspan=2, sticky="w", padx=4, pady=2)
+
+        ttk.Label(parent, text="Duree par debit (s)").grid(row=2, column=0, sticky="w", padx=4, pady=2)
+        self.noise_duration_var = tk.StringVar(value="5.0")
+        ttk.Entry(parent, textvariable=self.noise_duration_var, width=10).grid(
+            row=2, column=1, sticky="w", padx=4, pady=2)
+
+        self.noise_loop_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(parent, text="Boucler (repete jusqu'a l'arret)",
+                         variable=self.noise_loop_var).grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=4, pady=2)
+
+        btns = ttk.Frame(parent)
+        btns.grid(row=4, column=0, columnspan=3, sticky="w", padx=4, pady=(10, 2))
+        self.noise_start_btn = ttk.Button(btns, text="Demarrer le bruit", command=self._on_noise_start)
+        self.noise_start_btn.pack(side="left")
+        self.noise_stop_btn = ttk.Button(btns, text="Arreter", command=self._on_noise_stop, state="disabled")
+        self.noise_stop_btn.pack(side="left", padx=6)
+
     def _pick_output_dir(self) -> None:
         d = filedialog.askdirectory(initialdir=self.output_dir_var.get() or str(Path.home()))
         if d:
@@ -261,6 +306,7 @@ class App:
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.tone_start_btn.configure(state="disabled")
+        self.noise_start_btn.configure(state="disabled")
         self.status_var.set("Emission en cours...")
 
     def _on_stop(self) -> None:
@@ -300,6 +346,7 @@ class App:
         self.tone_start_btn.configure(state="disabled")
         self.tone_stop_btn.configure(state="normal")
         self.start_btn.configure(state="disabled")
+        self.noise_start_btn.configure(state="disabled")
         self.status_var.set("Balayage de tons en cours...")
 
     def _on_tone_stop(self) -> None:
@@ -307,13 +354,56 @@ class App:
         self.tone_stop_btn.configure(state="disabled")
         self.status_var.set("Arret demande...")
 
+    def _on_noise_start(self) -> None:
+        try:
+            bauds = [float(x.strip()) for x in self.noise_bauds_var.get().split(",") if x.strip()]
+            if not bauds:
+                raise ValueError("liste de debits vide")
+            duration = float(self.noise_duration_var.get())
+            loop = self.noise_loop_var.get()
+        except ValueError as exc:
+            messagebox.showerror("Parametre invalide", str(exc))
+            return
+
+        try:
+            _, rf = self._read_params()
+        except ValueError as exc:
+            messagebox.showerror("Parametre invalide", str(exc))
+            return
+
+        if not rf.file_mode and not messagebox.askyesno(
+            "Confirmer l'emission RF",
+            "Tu es sur le point d'emettre reellement sur "
+            f"{rf.center_freq_mhz} MHz via le Pluto ({rf.uri}) du bruit FSK.\n\n"
+            "Verifie ton autorisation avant de continuer.\n\nContinuer ?",
+        ):
+            return
+
+        self._noise_stop_event.clear()
+        self._noise_worker = threading.Thread(
+            target=self._run_noise_loop, args=(bauds, duration, loop, rf), daemon=True)
+        self._noise_worker.start()
+        self.noise_start_btn.configure(state="disabled")
+        self.noise_stop_btn.configure(state="normal")
+        self.start_btn.configure(state="disabled")
+        self.tone_start_btn.configure(state="disabled")
+        self.status_var.set("Bruit FSK en cours...")
+
+    def _on_noise_stop(self) -> None:
+        self._noise_stop_event.set()
+        self.noise_stop_btn.configure(state="disabled")
+        self.status_var.set("Arret demande...")
+
     def _on_close(self) -> None:
         self._stop_event.set()
         self._tone_stop_event.set()
+        self._noise_stop_event.set()
         if self._worker and self._worker.is_alive():
             self._worker.join(timeout=2.0)
         if self._tone_worker and self._tone_worker.is_alive():
             self._tone_worker.join(timeout=2.0)
+        if self._noise_worker and self._noise_worker.is_alive():
+            self._noise_worker.join(timeout=2.0)
         self.root.destroy()
 
     def _run_loop(self, params: SondeParams, rf: RFParams) -> None:
@@ -375,6 +465,7 @@ class App:
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.tone_start_btn.configure(state="normal")
+        self.noise_start_btn.configure(state="normal")
         self.status_var.set("Arrete.")
 
     def _run_tone_sweep_loop(self, freqs: list[float], duration: float, loop: bool, rf: RFParams) -> None:
@@ -450,6 +541,86 @@ class App:
         self.tone_start_btn.configure(state="normal")
         self.tone_stop_btn.configure(state="disabled")
         self.start_btn.configure(state="normal")
+        self.noise_start_btn.configure(state="normal")
+        self.status_var.set("Arrete.")
+
+    def _run_noise_loop(self, bauds: list[float], duration: float, loop: bool, rf: RFParams) -> None:
+        sample_rate = rf.sample_rate_msps * 1e6
+        tx = None
+        try:
+            if not rf.file_mode:
+                tx = PlutoTransmitter(
+                    uri=rf.uri,
+                    center_freq_hz=rf.center_freq_mhz * 1e6,
+                    sample_rate_hz=sample_rate,
+                    tx_gain_db=rf.tx_gain_db,
+                )
+                self._log(f"Pluto connecte ({rf.uri}), TX {rf.center_freq_mhz} MHz — bruit FSK.")
+            else:
+                self._log(f"Mode fichier : ecriture dans {rf.output_dir}")
+
+            rng = np.random.default_rng()
+
+            if rf.file_mode:
+                chunks = []
+                t_cursor = 0.0
+                for baud in bauds:
+                    chunks.append(generate_noise_fsk_chunk_iq(
+                        sample_rate, baud, duration, rf.deviation_hz, rf.bt, rng))
+                    self._log(f"  {baud:.0f} bauds : +{t_cursor:.1f}s -> +{t_cursor + duration:.1f}s")
+                    t_cursor += duration
+                iq = np.concatenate(chunks)
+                out_path = Path(rf.output_dir) / "noise_fsk.cfile"
+                iq.astype(np.complex64).tofile(out_path)
+                self._log(f"Bruit FSK -> {out_path.name} ({len(bauds)} debits, {iq.size} echantillons)")
+                return
+
+            # Meme decoupage en petits morceaux que le balayage de tons (voir
+            # _run_tone_sweep_loop) pour rester sous la taille de buffer TX
+            # acceptee par libiio/le Pluto.
+            assert tx is not None
+            chunk_s = 0.25
+            while not self._noise_stop_event.is_set():
+                start_clock = time.strftime("%H:%M:%S")
+                self._log(f"Debut du bruit FSK a {start_clock} — ordre des debits :")
+                t_cursor = 0.0
+                for baud in bauds:
+                    self._log(f"  {baud:.0f} bauds : +{t_cursor:.1f}s -> +{t_cursor + duration:.1f}s")
+                    t_cursor += duration
+                for baud in bauds:
+                    if self._noise_stop_event.is_set():
+                        break
+                    remaining = duration
+                    while remaining > 0:
+                        this_chunk = min(chunk_s, remaining)
+                        chunk_iq = generate_noise_fsk_chunk_iq(
+                            sample_rate, baud, this_chunk, rf.deviation_hz, rf.bt, rng)
+                        tx.send(chunk_iq)
+                        remaining -= this_chunk
+                        if self._noise_stop_event.is_set():
+                            break
+                self._log("Passage termine.")
+                if not loop:
+                    break
+                self._noise_stop_event.wait(0.5)
+
+        except PlutoNotAvailable as exc:
+            self._log(f"Erreur Pluto : {exc}")
+            messagebox.showerror("Pluto indisponible", str(exc))
+        except Exception as exc:  # pragma: no cover - remontee a l'utilisateur
+            self._log(f"Erreur : {exc}")
+            messagebox.showerror("Erreur", str(exc))
+        finally:
+            if tx is not None:
+                tx.close()
+            self._noise_stop_event.set()
+            self.root.after(0, self._on_noise_stopped)
+
+    def _on_noise_stopped(self) -> None:
+        self.noise_start_btn.configure(state="normal")
+        self.noise_stop_btn.configure(state="disabled")
+        self.start_btn.configure(state="normal")
+        self.tone_start_btn.configure(state="normal")
         self.status_var.set("Arrete.")
 
 
