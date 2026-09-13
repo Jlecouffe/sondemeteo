@@ -575,28 +575,37 @@ class App:
                 self._log(f"Bruit FSK -> {out_path.name} ({len(bauds)} debits, {iq.size} echantillons)")
                 return
 
-            # Meme decoupage en petits morceaux que le balayage de tons (voir
-            # _run_tone_sweep_loop) pour rester sous la taille de buffer TX
-            # acceptee par libiio/le Pluto.
+            # Chaque segment est genere EN UNE FOIS (voir generate_noise_fsk_
+            # chunk_iq) puis envoye par tranches de ~0.25s pour rester sous
+            # la taille de buffer TX acceptee par libiio/le Pluto (meme
+            # contrainte que le balayage de tons) - generer au fil de l'eau,
+            # tranche par tranche, s'est avere plus lent que le temps reel a
+            # bas debit et creait de vrais trous dans l'emission.
+            # Genere le premier segment avant de journaliser l'heure de
+            # debut : le calcul (jusqu'a ~1s a 1200 bauds) doit rester hors
+            # du chrono affiche a l'utilisateur, sinon les decalages
+            # annonces ne correspondent plus a l'heure reelle d'emission.
             assert tx is not None
-            chunk_s = 0.25
+            chunk_samples = max(1, int(round(0.25 * sample_rate)))
             while not self._noise_stop_event.is_set():
+                self._log("Preparation du passage (peut prendre 1-2s a bas debit)...")
+                segments_iq = [
+                    generate_noise_fsk_chunk_iq(sample_rate, baud, duration, rf.deviation_hz, rf.bt, rng)
+                    for baud in bauds
+                ]
+                if self._noise_stop_event.is_set():
+                    break
                 start_clock = time.strftime("%H:%M:%S")
                 self._log(f"Debut du bruit FSK a {start_clock} — ordre des debits :")
                 t_cursor = 0.0
                 for baud in bauds:
                     self._log(f"  {baud:.0f} bauds : +{t_cursor:.1f}s -> +{t_cursor + duration:.1f}s")
                     t_cursor += duration
-                for baud in bauds:
+                for segment_iq in segments_iq:
                     if self._noise_stop_event.is_set():
                         break
-                    remaining = duration
-                    while remaining > 0:
-                        this_chunk = min(chunk_s, remaining)
-                        chunk_iq = generate_noise_fsk_chunk_iq(
-                            sample_rate, baud, this_chunk, rf.deviation_hz, rf.bt, rng)
-                        tx.send(chunk_iq)
-                        remaining -= this_chunk
+                    for start in range(0, len(segment_iq), chunk_samples):
+                        tx.send(segment_iq[start:start + chunk_samples])
                         if self._noise_stop_event.is_set():
                             break
                 self._log("Passage termine.")
