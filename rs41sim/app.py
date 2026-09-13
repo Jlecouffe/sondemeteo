@@ -14,6 +14,7 @@ import numpy as np
 from .frame import SondeParams, build_frame
 from .modulate import gfsk_modulate
 from .pluto_tx import PlutoNotAvailable, PlutoTransmitter
+from .tone_sweep import generate_tone_sweep_iq
 from .trajectory import advance
 
 APP_TITLE = "Simulateur de trame RS41 (PlutoSDR)"
@@ -83,6 +84,13 @@ class App:
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
 
+        # Balayage de tons (debug reponse en frequence du pont audio cible,
+        # voir tone_sweep.py) : worker et etat separes de la boucle RS41
+        # ci-dessus, mais partage l'acces exclusif au Pluto (un seul des
+        # deux peut emettre a la fois, voir _on_tone_start/_on_start).
+        self._tone_stop_event = threading.Event()
+        self._tone_worker: threading.Thread | None = None
+
         self._build_ui()
         self.root.after(150, self._drain_log)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -94,11 +102,14 @@ class App:
 
         sonde_tab = ttk.Frame(notebook)
         rf_tab = ttk.Frame(notebook)
+        tone_tab = ttk.Frame(notebook)
         notebook.add(sonde_tab, text="Sonde / trajectoire / meteo")
         notebook.add(rf_tab, text="Parametres radio")
+        notebook.add(tone_tab, text="Balayage de tons (debug)")
 
         self._build_sonde_tab(sonde_tab)
         self._build_rf_tab(rf_tab)
+        self._build_tone_tab(tone_tab)
 
         bottom = ttk.Frame(self.root)
         bottom.pack(fill="x", padx=8, pady=(0, 8))
@@ -146,6 +157,41 @@ class App:
         self.output_dir_var = tk.StringVar(value=self.rf.output_dir)
         ttk.Entry(parent, textvariable=self.output_dir_var, width=28).grid(row=out_row, column=1, padx=4, pady=2)
         ttk.Button(parent, text="Parcourir...", command=self._pick_output_dir).grid(row=out_row, column=2, padx=4)
+
+    def _build_tone_tab(self, parent: ttk.Frame) -> None:
+        ttk.Label(
+            parent,
+            text=(
+                "Emet une suite de tons purs (au lieu d'une trame RS41), pour mesurer\n"
+                "la reponse en frequence reelle du pont audio recepteur : capture le\n"
+                "resultat (bouton debug cote radtel-tools) et compare l'amplitude recue\n"
+                "ton par ton avec la liste ci-dessous."
+            ),
+            justify="left",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=4, pady=(4, 10))
+
+        ttk.Label(parent, text="Frequences (Hz, separees par virgule)").grid(
+            row=1, column=0, sticky="w", padx=4, pady=2)
+        self.tone_freqs_var = tk.StringVar(value="300,500,800,1000,1500,2000,2500,3000,3500,4000")
+        ttk.Entry(parent, textvariable=self.tone_freqs_var, width=48).grid(
+            row=1, column=1, columnspan=2, sticky="w", padx=4, pady=2)
+
+        ttk.Label(parent, text="Duree par ton (s)").grid(row=2, column=0, sticky="w", padx=4, pady=2)
+        self.tone_duration_var = tk.StringVar(value="3.0")
+        ttk.Entry(parent, textvariable=self.tone_duration_var, width=10).grid(
+            row=2, column=1, sticky="w", padx=4, pady=2)
+
+        self.tone_loop_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(parent, text="Boucler (repete le balayage jusqu'a l'arret)",
+                         variable=self.tone_loop_var).grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=4, pady=2)
+
+        btns = ttk.Frame(parent)
+        btns.grid(row=4, column=0, columnspan=3, sticky="w", padx=4, pady=(10, 2))
+        self.tone_start_btn = ttk.Button(btns, text="Demarrer le balayage", command=self._on_tone_start)
+        self.tone_start_btn.pack(side="left")
+        self.tone_stop_btn = ttk.Button(btns, text="Arreter", command=self._on_tone_stop, state="disabled")
+        self.tone_stop_btn.pack(side="left", padx=6)
 
     def _pick_output_dir(self) -> None:
         d = filedialog.askdirectory(initialdir=self.output_dir_var.get() or str(Path.home()))
@@ -214,6 +260,7 @@ class App:
         self._worker.start()
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
+        self.tone_start_btn.configure(state="disabled")
         self.status_var.set("Emission en cours...")
 
     def _on_stop(self) -> None:
@@ -221,10 +268,52 @@ class App:
         self.stop_btn.configure(state="disabled")
         self.status_var.set("Arret demande...")
 
+    def _on_tone_start(self) -> None:
+        try:
+            freqs = [float(x.strip()) for x in self.tone_freqs_var.get().split(",") if x.strip()]
+            if not freqs:
+                raise ValueError("liste de frequences vide")
+            duration = float(self.tone_duration_var.get())
+            loop = self.tone_loop_var.get()
+        except ValueError as exc:
+            messagebox.showerror("Parametre invalide", str(exc))
+            return
+
+        try:
+            _, rf = self._read_params()
+        except ValueError as exc:
+            messagebox.showerror("Parametre invalide", str(exc))
+            return
+
+        if not rf.file_mode and not messagebox.askyesno(
+            "Confirmer l'emission RF",
+            "Tu es sur le point d'emettre reellement sur "
+            f"{rf.center_freq_mhz} MHz via le Pluto ({rf.uri}) un balayage de tons.\n\n"
+            "Verifie ton autorisation avant de continuer.\n\nContinuer ?",
+        ):
+            return
+
+        self._tone_stop_event.clear()
+        self._tone_worker = threading.Thread(
+            target=self._run_tone_sweep_loop, args=(freqs, duration, loop, rf), daemon=True)
+        self._tone_worker.start()
+        self.tone_start_btn.configure(state="disabled")
+        self.tone_stop_btn.configure(state="normal")
+        self.start_btn.configure(state="disabled")
+        self.status_var.set("Balayage de tons en cours...")
+
+    def _on_tone_stop(self) -> None:
+        self._tone_stop_event.set()
+        self.tone_stop_btn.configure(state="disabled")
+        self.status_var.set("Arret demande...")
+
     def _on_close(self) -> None:
         self._stop_event.set()
+        self._tone_stop_event.set()
         if self._worker and self._worker.is_alive():
             self._worker.join(timeout=2.0)
+        if self._tone_worker and self._tone_worker.is_alive():
+            self._tone_worker.join(timeout=2.0)
         self.root.destroy()
 
     def _run_loop(self, params: SondeParams, rf: RFParams) -> None:
@@ -285,6 +374,63 @@ class App:
     def _on_stopped(self) -> None:
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        self.tone_start_btn.configure(state="normal")
+        self.status_var.set("Arrete.")
+
+    def _run_tone_sweep_loop(self, freqs: list[float], duration: float, loop: bool, rf: RFParams) -> None:
+        sample_rate = rf.sample_rate_msps * 1e6
+        tx = None
+        try:
+            if not rf.file_mode:
+                tx = PlutoTransmitter(
+                    uri=rf.uri,
+                    center_freq_hz=rf.center_freq_mhz * 1e6,
+                    sample_rate_hz=sample_rate,
+                    tx_gain_db=rf.tx_gain_db,
+                )
+                self._log(f"Pluto connecte ({rf.uri}), TX {rf.center_freq_mhz} MHz — balayage de tons.")
+            else:
+                self._log(f"Mode fichier : ecriture dans {rf.output_dir}")
+
+            iq, segments = generate_tone_sweep_iq(
+                sample_rate, freqs, tone_duration_s=duration, deviation_hz=rf.deviation_hz)
+
+            if rf.file_mode:
+                out_path = Path(rf.output_dir) / "tone_sweep.cfile"
+                iq.astype(np.complex64).tofile(out_path)
+                self._log(f"Balayage -> {out_path.name} ({len(freqs)} tons, {iq.size} echantillons)")
+                for f_tone, t0, t1 in segments:
+                    self._log(f"  {f_tone:.0f} Hz : {t0:.1f}s -> {t1:.1f}s")
+                return
+
+            assert tx is not None
+            while not self._stop_event.is_set() and not self._tone_stop_event.is_set():
+                start_clock = time.strftime("%H:%M:%S")
+                self._log(f"Debut du balayage a {start_clock} — ordre des tons (decalage depuis ce debut) :")
+                for f_tone, t0, t1 in segments:
+                    self._log(f"  {f_tone:.0f} Hz : +{t0:.1f}s -> +{t1:.1f}s")
+                tx.send(iq)
+                self._log("Passage termine.")
+                if not loop:
+                    break
+                self._tone_stop_event.wait(0.5)
+
+        except PlutoNotAvailable as exc:
+            self._log(f"Erreur Pluto : {exc}")
+            messagebox.showerror("Pluto indisponible", str(exc))
+        except Exception as exc:  # pragma: no cover - remontee a l'utilisateur
+            self._log(f"Erreur : {exc}")
+            messagebox.showerror("Erreur", str(exc))
+        finally:
+            if tx is not None:
+                tx.close()
+            self._tone_stop_event.set()
+            self.root.after(0, self._on_tone_stopped)
+
+    def _on_tone_stopped(self) -> None:
+        self.tone_start_btn.configure(state="normal")
+        self.tone_stop_btn.configure(state="disabled")
+        self.start_btn.configure(state="normal")
         self.status_var.set("Arrete.")
 
 
