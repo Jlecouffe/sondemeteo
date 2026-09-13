@@ -409,7 +409,7 @@ class App:
             # a une taille de buffer TX refusee).
             assert tx is not None
             chunk_s = 0.25
-            while not self._stop_event.is_set() and not self._tone_stop_event.is_set():
+            while not self._tone_stop_event.is_set():
                 start_clock = time.strftime("%H:%M:%S")
                 self._log(f"Debut du balayage a {start_clock} — ordre des tons :")
                 t_cursor = 0.0
@@ -417,7 +417,7 @@ class App:
                     self._log(f"  {f_tone:.0f} Hz : +{t_cursor:.1f}s -> +{t_cursor + duration:.1f}s")
                     t_cursor += duration
                 for f_tone in freqs:
-                    if self._stop_event.is_set() or self._tone_stop_event.is_set():
+                    if self._tone_stop_event.is_set():
                         break
                     remaining = duration
                     phase = 0.0
@@ -427,7 +427,7 @@ class App:
                             sample_rate, f_tone, this_chunk, rf.deviation_hz, phase0=phase)
                         tx.send(chunk_iq)
                         remaining -= this_chunk
-                        if self._stop_event.is_set() or self._tone_stop_event.is_set():
+                        if self._tone_stop_event.is_set():
                             break
                 self._log("Passage termine.")
                 if not loop:
