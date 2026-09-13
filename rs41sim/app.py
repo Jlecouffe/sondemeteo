@@ -26,7 +26,13 @@ class RFParams:
         self.tx_gain_db = -30.0
         self.sample_rate_msps = 2.5
         self.deviation_hz = 2400.0
-        self.bt = 0.5
+        # BT=0.5 (spec RS41 reelle) rend les transitions trop lissees pour le
+        # decodeur cote radtel-tools (LocalSondeDecoder.kt), qui ne fait que
+        # du comptage de passages par zero sans filtre adapte : verifie par
+        # simulation bout-en-bout, ca echoue systematiquement en dessous de
+        # BT=1.0. On sacrifie donc un peu de purete spectrale pour rester
+        # decodable par cet outil precis.
+        self.bt = 1.0
         self.burst_period_s = 1.0
         self.file_mode = False
         self.output_dir = str(Path.home())
@@ -55,7 +61,7 @@ RF_LABELS = [
     ("tx_gain_db", "Gain TX (dB, ex: -30)"),
     ("sample_rate_msps", "Frequence d'echantillonnage (MSps, mini ~2.1 sur Pluto)"),
     ("deviation_hz", "Deviation FSK (Hz)"),
-    ("bt", "Filtre gaussien BT"),
+    ("bt", "Filtre gaussien BT (>=1.0 recommande pour rester decodable par radtel-tools)"),
     ("burst_period_s", "Periode entre trames (s)"),
 ]
 

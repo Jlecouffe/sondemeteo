@@ -1,35 +1,50 @@
 """Assemblage d'une trame RS41 complete (brouillee, avec FEC) a partir de
 parametres de simulation.
 
-Portions verifiees par recoupement de plusieurs sources publiques
-(rs1729/RS, projecthorus/radiosonde_auto_rx, bazjo/RS41_Decoding) :
-mot d'en-tete, masque de brouillage, CRC16, parametres GF(256)/Reed-Solomon.
+Disposition des champs calquee EXACTEMENT sur les decalages absolus lus par
+LocalSondeDecoder.kt (radtel-tools), qui ne fait pas d'analyse TLV generique
+mais lit des champs a position fixe dans la trame de 320 octets :
 
-Portions simplifiees / non garanties bit-a-bit conformes au format Vaisala
-reel (a adapter au besoin dans ton propre decodeur, voir docstrings) :
-- ordre des octets et disposition exacte des identifiants de bloc,
-- bloc PTU : ce module encode directement temperature/humidite/pression
-  sous forme de valeurs scalees, au lieu du schema reel Vaisala
-  (mesures brutes + polynome de calibration transmis par fragments).
-  Adapte cette partie si tu as besoin de reproduire exactement l'algorithme
-  Vaisala plutot que de simplement fournir des valeurs lisibles a decoder.
+    0x000-0x007  en-tete (HEADER), transmis EN CLAIR
+    0x008-0x037  parite Reed-Solomon (48 octets)
+    0x038        octet reserve/non utilise
+    0x039-0x03A  marqueur de bloc FRAME (0x79, 0x28) ; seul l'octet 0x039
+                 est verifie par le decodeur (== 0x79)
+    0x03B-0x03C  compteur de trame (u16 LE)
+    0x03D-0x044  indicatif/serial (8 caracteres ASCII)
+    0x045-0x111  zone non lue par le decodeur (bourrage)
+    0x112-0x113  marqueur de bloc GPS3 (0x7B, 0x15) ; seul 0x112 est verifie
+                 (== 0x7B)
+    0x114-0x11F  position ECEF X/Y/Z (i32 LE, centimetres)
+    0x120-0x125  vitesse ECEF Vx/Vy/Vz (i16 LE, cm/s)
+    0x126        nombre de satellites (u8)
+    0x127-0x13F  bourrage final
+
+Le decodeur ne lit ni CRC ni PTU/GPS-time : temperature/humidite/pression/
+batterie restent des parametres de SondeParams (utilises par l'IHM) mais ne
+sont pas actuellement transmis dans la trame RF, faute de champ decode cote
+radtel-tools. A ajouter ici le jour ou LocalSondeDecoder.kt saura les lire.
 """
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
 
 from . import gps
-from .crc import crc16_ccitt
 from .rs_fec import rs41_fec_parity
-from .scrambling import BLOCKS_LEN, HEADER, scramble
+from .scrambling import BLOCKS_LEN, HEADER, HEADER_LEN, scramble_at
 
-STATUS_ID = 0x7928
-GPS_TIME_ID = 0x7C1E
-GPS_POS_ID = 0x7B15
-PTU_ID = 0x7A2A
-ZERO_ID = 0x7611
+FRAME_ID = bytes([0x79, 0x28])
+GPS_POS_ID = bytes([0x7B, 0x15])
+
+# Decalages relatifs au debut de la zone "blocs" (absolu - HEADER_LEN - RS_PARITY_LEN, soit absolu - 56).
+REL_FRAME_ID = 0x039 - 56
+REL_FRAME_NO = 0x03B - 56
+REL_SERIAL = 0x03D - 56
+REL_GPS_POS_ID = 0x112 - 56
+REL_ECEF = 0x114 - 56
+REL_ECEF_V = 0x120 - 56
+REL_NUM_SATS = 0x126 - 56
 
 
 @dataclass
@@ -48,41 +63,27 @@ class SondeParams:
     num_sats: int = 9
     pdop_x10: int = 15
 
-    # Meteo
+    # Meteo (non transmis dans la trame actuelle, voir docstring du module)
     temperature_c: float = 15.0
     humidity_pct: float = 50.0
     pressure_hpa: float = 1013.0
 
-    # Statut
+    # Statut (non transmis dans la trame actuelle, voir docstring du module)
     battery_decivolts: int = 29  # 2.9 V
 
     def block_bytes(self) -> bytes:
         return _build_blocks(self)
 
 
-def _build_block(block_id: int, data: bytes) -> bytes:
-    if len(data) > 255:
-        raise ValueError("bloc trop long")
-    header = struct.pack(">HB", block_id, len(data))
-    crc = crc16_ccitt(header + data)
-    return header + data + struct.pack("<H", crc)
+def _build_blocks(p: SondeParams) -> bytes:
+    blocks = bytearray(BLOCKS_LEN)
 
-
-def _status_block(p: SondeParams) -> bytes:
+    blocks[REL_FRAME_ID:REL_FRAME_ID + 2] = FRAME_ID
+    struct.pack_into("<H", blocks, REL_FRAME_NO, p.frame_counter & 0xFFFF)
     serial8 = p.serial.encode("ascii", "replace")[:8].ljust(8, b" ")
-    data = struct.pack("<H", p.frame_counter & 0xFFFF) + serial8 + \
-        struct.pack("<BB", p.battery_decivolts & 0xFF, 0x00)
-    return _build_block(STATUS_ID, data)
+    blocks[REL_SERIAL:REL_SERIAL + 8] = serial8
 
-
-def _gps_time_block(p: SondeParams) -> bytes:
-    week, tow_ms = gps.gps_week_tow(datetime.now(timezone.utc))
-    data = struct.pack("<HIBB", week & 0xFFFF, tow_ms & 0xFFFFFFFF,
-                        p.num_sats & 0xFF, p.pdop_x10 & 0xFF)
-    return _build_block(GPS_TIME_ID, data)
-
-
-def _gps_pos_block(p: SondeParams) -> bytes:
+    blocks[REL_GPS_POS_ID:REL_GPS_POS_ID + 2] = GPS_POS_ID
     import math
     heading_rad = math.radians(p.heading_deg)
     v_east = p.horizontal_speed_ms * math.sin(heading_rad)
@@ -91,48 +92,21 @@ def _gps_pos_block(p: SondeParams) -> bytes:
         p.latitude_deg, p.longitude_deg, p.altitude_m,
         v_east, v_north, p.climb_rate_ms,
     )
-    data = struct.pack(
-        "<iiihhhBBB",
-        state.x_cm, state.y_cm, state.z_cm,
-        state.vx_cms, state.vy_cms, state.vz_cms,
-        p.num_sats & 0xFF, 0, p.pdop_x10 & 0xFF,
-    )
-    return _build_block(GPS_POS_ID, data)
+    struct.pack_into("<iii", blocks, REL_ECEF, state.x_cm, state.y_cm, state.z_cm)
+    struct.pack_into("<hhh", blocks, REL_ECEF_V, state.vx_cms, state.vy_cms, state.vz_cms)
+    blocks[REL_NUM_SATS] = p.num_sats & 0xFF
 
-
-def _ptu_block(p: SondeParams) -> bytes:
-    """Encodage simplifie (non standard Vaisala) : valeurs directes scalees."""
-    temp_x100 = round(p.temperature_c * 100)
-    hum_x10 = max(0, min(1000, round(p.humidity_pct * 10)))
-    press_x10 = max(0, min(65535, round(p.pressure_hpa * 10)))
-    data = struct.pack("<hHH", temp_x100, hum_x10, press_x10)
-    return _build_block(PTU_ID, data)
-
-
-def _zero_block(remaining_total_len: int) -> bytes:
-    data_len = remaining_total_len - 5
-    if data_len < 0:
-        raise ValueError("plus de place pour le bloc de bourrage")
-    return _build_block(ZERO_ID, bytes(data_len))
-
-
-def _build_blocks(p: SondeParams) -> bytes:
-    blocks = [
-        _status_block(p),
-        _gps_time_block(p),
-        _gps_pos_block(p),
-        _ptu_block(p),
-    ]
-    used = sum(len(b) for b in blocks)
-    blocks.append(_zero_block(BLOCKS_LEN - used))
-    out = b"".join(blocks)
-    assert len(out) == BLOCKS_LEN, f"attendu {BLOCKS_LEN} octets de blocs, obtenu {len(out)}"
-    return out
+    return bytes(blocks)
 
 
 def build_frame(p: SondeParams) -> bytes:
-    """Construit la trame RS41 complete de 320 octets, brouillee et prete a moduler."""
+    """Construit la trame RS41 complete de 320 octets, prete a moduler.
+
+    L'en-tete (8 octets) est transmis en clair ; seuls la parite et les
+    blocs (312 octets, positions 8..319) sont brouilles, en poursuivant le
+    cycle du masque a partir de l'index 8 (voir scrambling.scramble_at)."""
     blocks = p.block_bytes()
     parity = rs41_fec_parity(blocks)
-    raw = HEADER + parity + blocks
-    return scramble(raw)
+    payload = parity + blocks
+    scrambled_payload = scramble_at(payload, HEADER_LEN)
+    return HEADER + scrambled_payload

@@ -4,6 +4,16 @@ Valeurs issues des projets de retro-ingenierie publics (rs1729/RS,
 projecthorus/radiosonde_auto_rx, bazjo/RS41_Decoding). Le motif d'en-tete
 et le masque sont mutuellement coherents : HEADER[i] ^ MASK[i] == SYNC_WORD[i]
 pour i < 8, ce qui a ete verifie a la construction de ce module.
+
+IMPORTANT (corrige le 2026-09-13, cf. radtel-tools LocalSondeDecoder.kt) :
+HEADER est le mot reellement emis EN CLAIR sur l'air pour la synchronisation
+bit ; le brouillage XOR ne s'applique qu'a partir de l'octet 8 (parite +
+blocs), jamais aux 8 octets d'en-tete eux-memes. Les decodeurs (radtel-tools
+comme rs1729) correlent directement sur le motif HEADER dans le flux
+demodule, avant tout retrait de brouillage. SYNC_WORD (HEADER ^ MASK[:8])
+n'est PAS ce qui est transmis : c'etait une erreur de modelisation de
+l'ancienne version de frame.build_frame(), qui brouillait la trame entiere
+y compris l'en-tete et empechait donc toute synchronisation en reception.
 """
 from __future__ import annotations
 
@@ -36,5 +46,12 @@ PREAMBLE_BITS = 320
 
 
 def scramble(data: bytes) -> bytes:
-    """Applique/retire le brouillage XOR cyclique sur `data`."""
-    return bytes(b ^ MASK[i % len(MASK)] for i, b in enumerate(data))
+    """Applique/retire le brouillage XOR cyclique sur `data`, index 0 = MASK[0]."""
+    return scramble_at(data, 0)
+
+
+def scramble_at(data: bytes, start_index: int) -> bytes:
+    """Applique/retire le brouillage XOR cyclique sur `data`, en continuant le
+    cycle de MASK a partir de `start_index` (utile pour brouiller uniquement
+    la partie de la trame qui suit l'en-tete, qui lui doit rester en clair)."""
+    return bytes(b ^ MASK[(start_index + i) % len(MASK)] for i, b in enumerate(data))

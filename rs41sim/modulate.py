@@ -3,6 +3,13 @@
 RS41 : 4800 bauds, 2FSK avec mise en forme gaussienne, bits emis LSB en
 premier dans chaque octet. Un preambule de 320 bits alternes precede la
 trame (soit 320/4800 = 66.7 ms), suivi de la trame brouillee de 320 octets.
+
+BT par defaut = 1.0 (au lieu de 0.5, spec RS41 reelle) : verifie par
+simulation bout-en-bout (voir verify_decode.py), le decodeur cote
+radtel-tools (LocalSondeDecoder.kt) ne fait qu'un comptage de passages par
+zero sans filtre adapte, et perd totalement le calage bit en dessous de
+BT=1.0 (trop d'interference entre symboles). BT=0.5 reste plus proche du
+spectre reel Vaisala si jamais le decodeur cible change.
 """
 from __future__ import annotations
 
@@ -38,7 +45,7 @@ def build_bitstream(frame_bytes: bytes) -> np.ndarray:
 
 
 def gfsk_modulate(frame_bytes: bytes, sample_rate: float, deviation_hz: float = 2400.0,
-                   bt: float = 0.5, amplitude: float = 1.0) -> np.ndarray:
+                   bt: float = 1.0, amplitude: float = 1.0) -> np.ndarray:
     """Retourne un tableau complex128 d'echantillons IQ en bande de base."""
     bits = build_bitstream(frame_bytes)
     symbols = 2.0 * bits - 1.0  # NRZ {-1, +1}

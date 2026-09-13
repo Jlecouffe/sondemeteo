@@ -6,74 +6,67 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from rs41sim.crc import crc16_ccitt
 from rs41sim.frame import SondeParams, build_frame
 from rs41sim.modulate import build_bitstream, gfsk_modulate
 from rs41sim.rs_fec import rs41_fec_parity
-from rs41sim.scrambling import HEADER, MASK, NDATA_LEN, SYNC_WORD, scramble
+from rs41sim.scrambling import HEADER, MASK, NDATA_LEN, scramble_at
 
 
-def decode_blocks(blocks: bytes) -> list[tuple[int, bytes]]:
-    out = []
-    pos = 0
-    while pos < len(blocks):
-        block_id, length = struct.unpack_from(">HB", blocks, pos)
-        data = blocks[pos + 3: pos + 3 + length]
-        (crc_read,) = struct.unpack_from("<H", blocks, pos + 3 + length)
-        crc_calc = crc16_ccitt(blocks[pos: pos + 3 + length])
-        assert crc_read == crc_calc, f"CRC invalide pour le bloc 0x{block_id:04X}"
-        out.append((block_id, data))
-        pos += 3 + length + 2
-    return out
-
-
-def test_sync_word_matches_known_rs41_value():
-    assert SYNC_WORD == bytes([0x86, 0x35, 0xF4, 0x40, 0x93, 0xDF, 0x1A, 0x60])
-
-
-def test_scramble_is_involutive():
-    data = bytes(range(256)) * 2
-    assert scramble(scramble(data)) == data
-
-
-def test_build_frame_length_and_header():
+def test_build_frame_length_and_clear_header():
+    """L'en-tete est transmis EN CLAIR : LocalSondeDecoder.kt (radtel-tools)
+    correle sur ce motif directement dans le flux demodule, avant tout
+    retrait de brouillage."""
     p = SondeParams()
     frame = build_frame(p)
     assert len(frame) == NDATA_LEN
-    raw = scramble(frame)  # scramble() est sa propre inverse (XOR)
-    assert raw[:8] == HEADER
+    assert frame[:8] == HEADER
 
 
-def test_all_blocks_have_valid_crc_and_reach_expected_length():
-    p = SondeParams(serial="TESTSN01", temperature_c=-12.3, humidity_pct=87.5,
-                     pressure_hpa=234.5, latitude_deg=48.85, longitude_deg=2.35,
-                     altitude_m=8500.0)
+def test_scramble_at_is_involutive():
+    data = bytes(range(256)) * 2
+    assert scramble_at(scramble_at(data, 8), 8) == data
+
+
+def test_payload_after_header_matches_scrambled_parity_and_blocks():
+    p = SondeParams(serial="TESTSN01", frame_counter=4242,
+                     latitude_deg=48.85, longitude_deg=2.35, altitude_m=8500.0)
     frame = build_frame(p)
-    raw = scramble(frame)
-    blocks = raw[56:]
-    assert len(blocks) == 264
-    parsed = decode_blocks(blocks)
-    ids = [bid for bid, _ in parsed]
-    assert 0x7928 in ids and 0x7A2A in ids and 0x7B15 in ids and 0x7C1E in ids and 0x7611 in ids
+    blocks = p.block_bytes()
+    parity = rs41_fec_parity(blocks)
+    expected_payload = scramble_at(parity + blocks, 8)
+    assert frame[8:] == expected_payload
 
 
-def test_rs_parity_is_reproducible_from_blocks():
-    p = SondeParams()
+def test_fixed_offsets_match_local_sonde_decoder():
+    """Verifie que les octets tombent exactement aux decalages absolus lus
+    par LocalSondeDecoder.kt une fois le brouillage retire (voir docstring
+    de rs41sim.frame)."""
+    p = SondeParams(serial="TESTSN01", frame_counter=4242,
+                     latitude_deg=48.85, longitude_deg=2.35, altitude_m=8500.0,
+                     num_sats=11)
     frame = build_frame(p)
-    raw = scramble(frame)
-    blocks = raw[56:]
-    parity_in_frame = raw[8:56]
-    assert rs41_fec_parity(blocks) == parity_in_frame
+    unscrambled_payload = scramble_at(frame[8:], 8)
+    raw = frame[:8] + unscrambled_payload
+
+    assert raw[0x039] == 0x79
+    assert raw[0x03A] == 0x28
+    (frame_no,) = struct.unpack_from("<H", raw, 0x03B)
+    assert frame_no == 4242
+    assert raw[0x03D:0x045] == b"TESTSN01"
+
+    assert raw[0x112] == 0x7B
+    assert raw[0x113] == 0x15
+    assert raw[0x126] == 11
 
 
-def test_frame_counter_round_trips_through_status_block():
-    p = SondeParams(frame_counter=4242)
+def test_frame_counter_and_serial_round_trip():
+    p = SondeParams(serial="ABCD1234", frame_counter=17)
     frame = build_frame(p)
-    raw = scramble(frame)
-    blocks = decode_blocks(raw[56:])
-    status_data = dict(blocks)[0x7928]
-    (fc,) = struct.unpack_from("<H", status_data, 0)
-    assert fc == 4242
+    unscrambled_payload = scramble_at(frame[8:], 8)
+    raw = frame[:8] + unscrambled_payload
+    (fc,) = struct.unpack_from("<H", raw, 0x03B)
+    assert fc == 17
+    assert raw[0x03D:0x045] == b"ABCD1234"
 
 
 def test_bitstream_uses_lsb_first_and_alternating_preamble():
