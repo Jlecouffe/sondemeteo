@@ -11,7 +11,11 @@ from rs41sim.frame import SondeParams, build_frame
 from rs41sim.modulate import gfsk_modulate
 from rs41sim.scrambling import MASK
 
-SAMPLE_RATE = 44100.0
+# 32 kHz = debit reel du pont audio Bluetooth RT-660 (Rt660AudioFraming.SAMPLE_RATE
+# cote radtel-tools), pas 44.1 kHz : c'est ce qui compte pour ce test, un signal
+# qui decode bien a 44.1 kHz peut echouer a 32 kHz (calage bit moins precis, voir
+# app.py / modulate.py pour le choix de BT).
+SAMPLE_RATE = 32000.0
 
 RS41_HEADER_BITS = "0000100001101101010100111000100001000100011010010100100000011111"
 RS41_HEADER = [int(c) for c in RS41_HEADER_BITS]
@@ -152,7 +156,7 @@ def main():
                      climb_rate_ms=5.2, horizontal_speed_ms=12.0, heading_deg=90.0,
                      num_sats=11)
     frame_bytes = build_frame(p)
-    iq = gfsk_modulate(frame_bytes, sample_rate=SAMPLE_RATE, bt=1.0)
+    iq = gfsk_modulate(frame_bytes, sample_rate=SAMPLE_RATE)  # bt par defaut du module
     pcm = fm_discriminate(iq)
 
     result, error = decode_rs41(pcm)
